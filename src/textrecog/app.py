@@ -83,11 +83,15 @@ class TextRecogApp:
         snapshot = self.overlay.snapshot()
         if snapshot is None:
             return
-        img = snapshot.crop(vx, vy, vw, vh)
-        if img.size == 0 or img.shape[0] < 2 or img.shape[1] < 2:
-            return
         if not self._ocr_ready:
+            self.overlay.release_snapshot()
             self.tray.show_message("TextRecog", "OCR is still loading. Please try again shortly.", warning=True)
+            return
+        try:
+            img = snapshot.crop(vx, vy, vw, vh)
+        finally:
+            self.overlay.release_snapshot()
+        if img.size == 0 or img.shape[0] < 2 or img.shape[1] < 2:
             return
         self._last_anchor_phys = (vx, vy)
         self.result_window.show_pending(self._last_anchor_phys)

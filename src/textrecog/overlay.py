@@ -181,6 +181,10 @@ class OverlaySelector(QWidget):
     def contextMenuEvent(self, event) -> None:  # noqa: N802
         event.accept()
 
+    def closeEvent(self, event) -> None:  # noqa: N802
+        self._pixmap = QPixmap()
+        super().closeEvent(event)
+
     def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802
         if event.key() == Qt.Key_Escape:
             self.cancelled.emit()
@@ -240,6 +244,7 @@ class OverlayController(QObject):
 
         if not self._windows:
             self._busy = False
+            self._snapshot = None
             return
 
         for win in self._windows:
@@ -265,6 +270,7 @@ class OverlayController(QObject):
         if self._finishing:
             return
         self._finishing = True
+        self._snapshot = None
         self.cancelled.emit()
         self._close_windows()
 
@@ -273,6 +279,7 @@ class OverlayController(QObject):
         if not self._windows:
             self._busy = False
             self._finishing = False
+            self._snapshot = None
 
     def _close_windows(self) -> None:
         for win in list(self._windows):
@@ -280,3 +287,6 @@ class OverlayController(QObject):
 
     def snapshot(self) -> VirtualDesktop | None:
         return self._snapshot
+
+    def release_snapshot(self) -> None:
+        self._snapshot = None
