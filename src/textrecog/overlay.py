@@ -7,9 +7,6 @@ to the target screen before invoking. Cross-monitor drag is a future extension.
 """
 from __future__ import annotations
 
-import ctypes
-from ctypes import wintypes
-
 from PySide6.QtCore import QObject, QPoint, QPointF, QRect, Qt, Signal
 from PySide6.QtGui import (
     QColor,
@@ -25,12 +22,6 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import QWidget
 
 from .capture import MonitorRect, VirtualDesktop, grab_virtual_desktop
-
-
-def _get_cursor_physical_pos() -> tuple[int, int]:
-    pt = wintypes.POINT()
-    ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
-    return int(pt.x), int(pt.y)
 
 
 def _match_qscreen(target: MonitorRect) -> QScreen:
@@ -96,6 +87,7 @@ class OverlaySelector(QWidget):
         self.setMouseTracking(True)
         self._press: QPointF | None = None
         self._cur: QPointF | None = None
+        self._right_cancel_pending = False
 
     def _selection_rect(self) -> QRect | None:
         if self._press is None or self._cur is None:
@@ -143,21 +135,39 @@ class OverlaySelector(QWidget):
         painter.end()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if event.button() == Qt.RightButton:
+            self._press = None
+            self._cur = None
+            self._right_cancel_pending = True
+            event.accept()
+            return
         if event.button() != Qt.LeftButton:
             return
+        event.accept()
         self._press = event.position()
         self._cur = event.position()
         self.update()
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if self._right_cancel_pending:
+            event.accept()
+            return
         if self._press is None:
             return
+        event.accept()
         self._cur = event.position()
         self.update()
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if event.button() == Qt.RightButton and self._right_cancel_pending:
+            self._right_cancel_pending = False
+            event.accept()
+            self.cancelled.emit()
+            self.close()
+            return
         if event.button() != Qt.LeftButton or self._press is None:
             return
+        event.accept()
         rect = self._selection_rect()
         self._press = None
         self._cur = None
@@ -167,6 +177,9 @@ class OverlaySelector(QWidget):
             return
         self.selectionCommitted.emit(rect)
         self.close()
+
+    def contextMenuEvent(self, event) -> None:  # noqa: N802
+        event.accept()
 
     def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802
         if event.key() == Qt.Key_Escape:
@@ -183,13 +196,12 @@ class OverlayController(QObject):
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
         self._snapshot: VirtualDesktop | None = None
-        self._window: OverlaySelector | None = None
-        self._monitor: MonitorRect | None = None
-        self._dpr: float = 1.0
+        self._windows: list[OverlaySelector] = []
         self._busy = False
+        self._finishing = False
 
     def is_active(self) -> bool:
-        return self._window is not None
+        return bool(self._windows)
 
     def start_capture(self) -> None:
         if self._busy:
@@ -200,55 +212,71 @@ class OverlayController(QObject):
             print(f"[overlay] failed to grab desktop: {exc}")
             return
 
-        cx, cy = _get_cursor_physical_pos()
-        target = next(
-            (m for m in self._snapshot.monitors
-             if m.left <= cx < m.right and m.top <= cy < m.bottom),
-            None,
-        )
-        if target is None:
-            target = self._snapshot.monitors[0]
-
-        slice_bgr = self._snapshot.crop(target.left, target.top, target.width, target.height)
-        qimg = _bgr_to_qimage(slice_bgr)
-        screen = _match_qscreen(target)
-        dpr = screen.devicePixelRatio()
-        pix = QPixmap.fromImage(qimg)
-        pix.setDevicePixelRatio(dpr)
-
-        self._monitor = target
-        self._dpr = dpr
         self._busy = True
-        win = OverlaySelector(screen, target, pix)
-        win.selectionCommitted.connect(self._on_committed)
-        win.cancelled.connect(self._on_cancelled)
-        win.destroyed.connect(self._on_destroyed)
-        win.show()
-        win.activateWindow()
-        win.raise_()
-        win.setFocus(Qt.OtherFocusReason)
-        self._window = win
+        self._finishing = False
+        self._windows = []
 
-    def _on_committed(self, rect: QRect) -> None:
-        if self._monitor is None:
+        for monitor in self._snapshot.monitors:
+            slice_bgr = self._snapshot.crop(monitor.left, monitor.top, monitor.width, monitor.height)
+            qimg = _bgr_to_qimage(slice_bgr)
+            screen = _match_qscreen(monitor)
+            dpr = screen.devicePixelRatio()
+            pix = QPixmap.fromImage(qimg)
+            pix.setDevicePixelRatio(dpr)
+
+            win = OverlaySelector(screen, monitor, pix)
+            win.selectionCommitted.connect(
+                lambda rect, selected_monitor=monitor, selected_dpr=dpr: self._on_committed(
+                    rect,
+                    selected_monitor,
+                    selected_dpr,
+                )
+            )
+            win.cancelled.connect(self._on_cancelled)
+            win.destroyed.connect(lambda *_args, closed_window=win: self._on_destroyed(closed_window))
+            win.show()
+            win.raise_()
+            self._windows.append(win)
+
+        if not self._windows:
+            self._busy = False
             return
+
+        for win in self._windows:
+            win.activateWindow()
+        self._windows[-1].setFocus(Qt.OtherFocusReason)
+
+    def _on_committed(self, rect: QRect, monitor: MonitorRect, dpr: float) -> None:
+        if self._finishing:
+            return
+        self._finishing = True
         # rect is in widget-logical coords (DIPs). Convert to physical px on
         # this monitor, then offset by the monitor's virtual-desktop origin.
-        phys_x = round(rect.x() * self._dpr)
-        phys_y = round(rect.y() * self._dpr)
-        phys_w = round(rect.width() * self._dpr)
-        phys_h = round(rect.height() * self._dpr)
-        vx = self._monitor.left + phys_x
-        vy = self._monitor.top + phys_y
+        phys_x = round(rect.x() * dpr)
+        phys_y = round(rect.y() * dpr)
+        phys_w = round(rect.width() * dpr)
+        phys_h = round(rect.height() * dpr)
+        vx = monitor.left + phys_x
+        vy = monitor.top + phys_y
         self.regionSelected.emit(int(vx), int(vy), int(phys_w), int(phys_h))
+        self._close_windows()
 
     def _on_cancelled(self) -> None:
+        if self._finishing:
+            return
+        self._finishing = True
         self.cancelled.emit()
+        self._close_windows()
 
-    def _on_destroyed(self, *_args) -> None:
-        self._window = None
-        self._monitor = None
-        self._busy = False
+    def _on_destroyed(self, closed_window: OverlaySelector) -> None:
+        self._windows = [win for win in self._windows if win is not closed_window]
+        if not self._windows:
+            self._busy = False
+            self._finishing = False
+
+    def _close_windows(self) -> None:
+        for win in list(self._windows):
+            win.close()
 
     def snapshot(self) -> VirtualDesktop | None:
         return self._snapshot
