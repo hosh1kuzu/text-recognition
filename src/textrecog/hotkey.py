@@ -12,6 +12,7 @@ from ctypes import wintypes
 from PySide6.QtCore import QAbstractNativeEventFilter, QObject, Signal
 
 from .config import Hotkey
+from .diagnostics import log_event
 
 WM_HOTKEY = 0x0312
 _HOTKEY_ID = 1
@@ -46,14 +47,17 @@ class HotkeyManager(QAbstractNativeEventFilter, QObject):
             self.unregister()
         ok = _user32.RegisterHotKey(None, _HOTKEY_ID, hotkey.mods, hotkey.vk)
         if not ok:
+            log_event("hotkey", "register failed", hotkey=hotkey.display(), mods=hotkey.mods, vk=hotkey.vk)
             raise HotkeyError(
                 f"Failed to register hotkey {hotkey.display()!r} — likely already in use"
             )
         self._registered = hotkey
+        log_event("hotkey", "registered", hotkey=hotkey.display(), mods=hotkey.mods, vk=hotkey.vk)
 
     def unregister(self) -> None:
         if self._registered is None:
             return
+        log_event("hotkey", "unregister", hotkey=self._registered.display())
         _user32.UnregisterHotKey(None, _HOTKEY_ID)
         self._registered = None
 
@@ -61,5 +65,6 @@ class HotkeyManager(QAbstractNativeEventFilter, QObject):
         if eventType == b"windows_generic_MSG" or eventType == "windows_generic_MSG":
             msg = wintypes.MSG.from_address(int(message))
             if msg.message == WM_HOTKEY and msg.wParam == _HOTKEY_ID:
+                log_event("hotkey", "wm_hotkey", wparam=int(msg.wParam), lparam=int(msg.lParam))
                 self.triggered.emit()
         return False, 0

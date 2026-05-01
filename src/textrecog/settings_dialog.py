@@ -6,6 +6,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QFormLayout,
+    QCheckBox,
     QKeySequenceEdit,
     QLabel,
     QMessageBox,
@@ -14,6 +15,7 @@ from PySide6.QtGui import QKeySequence
 
 from .config import Hotkey, MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN
 from .hotkey import HotkeyError, HotkeyManager
+from .ui import make_app_icon, settings_dialog_stylesheet
 
 
 def _qkey_to_hotkey(seq: QKeySequence) -> Hotkey:
@@ -51,22 +53,30 @@ def _qkey_to_hotkey(seq: QKeySequence) -> Hotkey:
 
 
 class SettingsDialog(QDialog):
-    def __init__(self, current_text: str, manager: HotkeyManager, parent=None) -> None:
+    def __init__(self, current_text: str, start_on_login: bool, manager: HotkeyManager, parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("设置")
+        self.setWindowIcon(make_app_icon())
+        self.setStyleSheet(settings_dialog_stylesheet())
         self._manager = manager
         self._result_text: str | None = None
 
         self._key_edit = QKeySequenceEdit()
         self._key_edit.setKeySequence(QKeySequence(current_text.replace("Win", "Meta")))
+        self._start_on_login = QCheckBox("开机启动")
+        self._start_on_login.setChecked(start_on_login)
 
         info = QLabel("快捷键需要包含至少一个修饰键（Ctrl/Alt/Shift/Win），"
                       "并以 A-Z、0-9 或 F1-F24 中的一个键结束。")
+        info.setObjectName("helpLabel")
         info.setWordWrap(True)
-        info.setStyleSheet("color: #666;")
 
         form = QFormLayout()
+        form.setContentsMargins(20, 20, 20, 16)
+        form.setHorizontalSpacing(14)
+        form.setVerticalSpacing(14)
         form.addRow("全局快捷键：", self._key_edit)
+        form.addRow("", self._start_on_login)
         form.addRow(info)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -75,10 +85,13 @@ class SettingsDialog(QDialog):
 
         form.addRow(buttons)
         self.setLayout(form)
-        self.resize(400, 160)
+        self.resize(440, 220)
 
     def hotkey_text(self) -> str | None:
         return self._result_text
+
+    def start_on_login(self) -> bool:
+        return self._start_on_login.isChecked()
 
     def _on_accept(self) -> None:
         seq = self._key_edit.keySequence()
