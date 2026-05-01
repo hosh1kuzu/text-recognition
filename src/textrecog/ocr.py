@@ -17,6 +17,8 @@ from PySide6.QtCore import QObject, QTimer, Signal
 
 import numpy as np
 
+from .diagnostics import log_event, log_exception, setup_logging
+
 
 MAX_OCR_PIXELS = 2_000_000
 MAX_OCR_SIDE = 1800
@@ -42,30 +44,40 @@ _CLS_URL = "https://paddleocr.bj.bcebos.com/dygraph_v2.0/ch/ch_ppocr_mobile_v2.0
 
 
 def _ocr_process_main(in_queue, out_queue, lang: str, use_angle_cls: bool) -> None:
+    setup_logging()
+    log_event("ocr-child", "process start", lang=lang, use_angle_cls=use_angle_cls)
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     os.environ.setdefault("MKL_NUM_THREADS", "1")
     _hide_child_console_windows()
     try:
+        log_event("ocr-child", "initializing engine")
         ocr = _FastPaddleOcr(lang=lang, use_angle_cls=use_angle_cls)
         out_queue.put(("ready", None))
+        log_event("ocr-child", "ready")
     except Exception as exc:
+        log_exception("ocr-child", "init failed", exc)
         out_queue.put(("failed", _format_exc("OCR init failed", exc)))
         return
 
     while True:
         cmd, payload = in_queue.get()
+        log_event("ocr-child", "command received", command=cmd)
         if cmd == "stop":
+            log_event("ocr-child", "stop")
             return
         if cmd != "recognize":
             continue
         try:
             img = payload
+            log_event("ocr-child", "recognize start", shape=getattr(img, "shape", None))
             started = time.perf_counter()
             raw = ocr.ocr(img, cls=use_angle_cls)
             text = _extract_text(raw)
             elapsed = time.perf_counter() - started
             out_queue.put(("result", text, elapsed, img.shape[1], img.shape[0]))
+            log_event("ocr-child", "recognize done", elapsed=round(elapsed, 3), chars=len(text))
         except Exception as exc:
+            log_exception("ocr-child", "recognize failed", exc)
             out_queue.put(("failed", _format_exc("OCR failed", exc)))
 
 
@@ -313,6 +325,9 @@ class OcrService(QObject):
         self._ready_emitted = False
         self._worker_failed = False
         self._busy = False
+        self._stopping = False
+        self._restart_count = 0
+        self._max_restarts = 2
 
         self._poll_timer = QTimer(self)
         self._poll_timer.setInterval(50)
@@ -320,7 +335,10 @@ class OcrService(QObject):
 
     def start(self) -> None:
         if self._proc is not None and self._proc.is_alive():
+            log_event("ocr", "start ignored: already alive", pid=self._proc.pid)
             return
+        log_event("ocr", "start", lang=self._lang, use_angle_cls=self._use_angle_cls)
+        self._stopping = False
         self._ready_emitted = False
         self._worker_failed = False
         self._busy = False
@@ -333,9 +351,12 @@ class OcrService(QObject):
         )
         self._proc.daemon = True
         _start_process_hidden(self._proc)
+        log_event("ocr", "process started", pid=self._proc.pid)
         self._poll_timer.start()
 
     def stop(self) -> None:
+        log_event("ocr", "stop", has_proc=self._proc is not None, alive=(self._proc.is_alive() if self._proc is not None else None))
+        self._stopping = True
         self._poll_timer.stop()
         if self._proc is not None and self._proc.is_alive():
             try:
@@ -345,6 +366,7 @@ class OcrService(QObject):
                 pass
             self._proc.join(1.5)
             if self._proc.is_alive():
+                log_event("ocr", "terminate process", pid=self._proc.pid)
                 self._proc.terminate()
                 self._proc.join(1.0)
         self._close_queues()
@@ -353,6 +375,7 @@ class OcrService(QObject):
         self._busy = False
 
     def recognize(self, img: np.ndarray) -> None:
+        log_event("ocr", "recognize request", shape=img.shape, busy=self._busy, has_proc=self._proc is not None, alive=(self._proc.is_alive() if self._proc is not None else None))
         if self._proc is None or not self._proc.is_alive() or self._in_queue is None:
             self.failed.emit("OCR worker is not running")
             return
@@ -372,42 +395,66 @@ class OcrService(QObject):
         try:
             self._busy = True
             self._in_queue.put_nowait(("recognize", img))
+            log_event("ocr", "recognize queued", shape=img.shape)
         except queue.Full:
             self._busy = False
+            log_event("ocr", "recognize queue full")
             self.failed.emit("OCR worker is busy")
 
     def _poll_worker(self) -> None:
-        if self._out_queue is not None:
+        out_queue = self._out_queue
+        if out_queue is not None:
             while True:
                 try:
-                    msg = self._out_queue.get_nowait()
+                    msg = out_queue.get_nowait()
                 except queue.Empty:
                     break
-                self._handle_worker_message(msg)
+                except Exception as exc:
+                    # Worker may have crashed mid-write, leaving a partial/corrupt
+                    # message in the pipe. Discard and let the process-death check
+                    # below handle the failure path.
+                    log_exception("ocr", "queue read error", exc)
+                    break
+                try:
+                    self._handle_worker_message(msg)
+                except Exception as exc:
+                    log_exception("ocr", "message handling error", exc, msg=msg)
+                if self._out_queue is not out_queue:
+                    break
 
-        if self._proc is None or self._proc.is_alive():
+        proc = self._proc
+        if proc is None or proc.is_alive():
             return
-        exitcode = self._proc.exitcode
+        exitcode = proc.exitcode
+        log_event("ocr", "process exited", pid=proc.pid, exitcode=exitcode, busy=self._busy, ready=self._ready_emitted, worker_failed=self._worker_failed)
         self._poll_timer.stop()
         self._close_queues()
         self._proc = None
         if not self._worker_failed and (self._busy or not self._ready_emitted or exitcode not in (0, None)):
             self._busy = False
-            self.failed.emit(f"OCR worker exited unexpectedly (code {exitcode})")
+            if not self._stopping and self._restart_count < self._max_restarts:
+                self._restart_count += 1
+                self.failed.emit(f"OCR 进程异常退出，已自动重启。请重新截图识别。")
+                self.statusChanged.emit(f"OCR 进程正在重启 ({self._restart_count}/{self._max_restarts})…")
+                self.start()
+            else:
+                self.failed.emit(f"OCR worker exited unexpectedly (code {exitcode})")
 
     def _handle_worker_message(self, msg) -> None:
         kind = msg[0]
+        log_event("ocr", "worker message", kind=kind)
         if kind == "ready":
             self._ready_emitted = True
             self.ready.emit()
         elif kind == "result":
             _, text, elapsed, w, h = msg
             self._busy = False
-            print(f"[ocr] inference {w}x{h} in {elapsed:.2f}s")
+            log_event("ocr", "result", w=w, h=h, elapsed=round(elapsed, 3), chars=len(text))
             self.resultReady.emit(text)
         elif kind == "failed":
             self._busy = False
             self._worker_failed = True
+            log_event("ocr", "failed message", message=str(msg[1]))
             self.failed.emit(str(msg[1]))
 
     def _close_queues(self) -> None:
@@ -415,9 +462,13 @@ class OcrService(QObject):
             if q is None:
                 continue
             try:
+                # cancel_join_thread() prevents the GUI thread from blocking on
+                # join_thread() when the worker has died mid-write and the feeder
+                # thread is stuck trying to flush to a broken pipe.
+                q.cancel_join_thread()
                 q.close()
-                q.join_thread()
             except Exception:
+                log_event("ocr", "queue close failed")
                 pass
         self._in_queue = None
         self._out_queue = None
